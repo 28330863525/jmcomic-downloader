@@ -12,6 +12,8 @@ const store = useStore()
 
 const message = useMessage()
 
+const PAGE_SIZE = 80
+
 const sortOptions: SelectProps['options'] = [
   { label: '最新', value: 'Latest' },
   { label: '最多点击', value: 'View' },
@@ -21,11 +23,11 @@ const sortOptions: SelectProps['options'] = [
 
 const searchInput = ref<string>('')
 const searching = ref<boolean>(false)
+const downloadingAllSearchResults = ref<boolean>(false)
 const sortSelected = ref<SearchSort>('Latest')
 const searchPage = ref<number>(1)
 
 const searchPageCount = computed(() => {
-  const PAGE_SIZE = 80
   if (store.searchResult === undefined) {
     return 0
   }
@@ -68,6 +70,94 @@ async function search(keyword: string, page: number, sort: SearchSort) {
 
   searching.value = false
 }
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms))
+}
+
+async function collectSearchResultIds(keyword: string, sort: SearchSort): Promise<number[]> {
+  const ids = new Set<number>()
+  const pageCount = searchPageCount.value
+
+  for (let page = 1; page <= pageCount; page += 1) {
+    let content = store.searchResult?.content
+    if (page !== searchPage.value) {
+      const result = await commands.search(keyword, page, sort)
+      if (result.status === 'error') {
+        console.error(result.error)
+        continue
+      }
+
+      const searchResultVariant = result.data
+      if (!('SearchResult' in searchResultVariant)) {
+        continue
+      }
+
+      content = searchResultVariant.SearchResult.content
+    }
+
+    content?.forEach((comic) => {
+      if (!comic.isDownloaded) {
+        ids.add(comic.id)
+      }
+    })
+
+    await sleep(150)
+  }
+
+  return Array.from(ids)
+}
+
+async function downloadAllSearchResults() {
+  if (downloadingAllSearchResults.value) {
+    message.warning('正在批量加入下载队列，请稍后再试')
+    return
+  }
+
+  if (searching.value) {
+    message.warning('有搜索正在进行，请稍后再试')
+    return
+  }
+
+  if (store.searchResult === undefined || searchPageCount.value <= 0) {
+    message.warning('没有可下载的搜索结果')
+    return
+  }
+
+  const keyword = searchInput.value.trim()
+  if (keyword.length === 0) {
+    message.warning('请先输入关键词并完成搜索')
+    return
+  }
+
+  downloadingAllSearchResults.value = true
+
+  let queuedCount = 0
+  let failedCount = 0
+
+  try {
+    const ids = await collectSearchResultIds(keyword, sortSelected.value)
+    if (ids.length === 0) {
+      message.warning('没有新的搜索结果需要下载')
+      return
+    }
+
+    for (const id of ids) {
+      const result = await commands.downloadComic(id)
+      if (result.status === 'error') {
+        console.error(result.error)
+        failedCount += 1
+      } else {
+        queuedCount += 1
+      }
+      await sleep(150)
+    }
+
+    message.success(`已加入队列：${queuedCount}，失败：${failedCount}，跳过已下载：${Math.max(0, store.searchResult.total - ids.length)}`)
+  } finally {
+    downloadingAllSearchResults.value = false
+  }
+}
 </script>
 
 <template>
@@ -99,6 +189,18 @@ async function search(keyword: string, page: number, sort: SearchSort) {
         </template>
       </n-button>
     </n-input-group>
+
+    <n-button
+      v-if="store.searchResult !== undefined"
+      class="mx-2"
+      type="primary"
+      secondary
+      size="small"
+      :loading="downloadingAllSearchResults"
+      :disabled="searchPageCount <= 0"
+      @click="downloadAllSearchResults">
+      一键下载全部搜索结果（{{ store.searchResult.total }}）
+    </n-button>
 
     <div v-if="store.searchResult !== undefined" class="flex flex-col gap-row-2 overflow-auto box-border px-2">
       <ComicCard
