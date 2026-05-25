@@ -34,6 +34,109 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Patch cover download handling
+        shell: pwsh
+        run: |
+          $path = "src-tauri/src/download_manager.rs"
+          $content = Get-Content -Raw -Encoding UTF8 $path
+
+          $oldCoverFailure = @'
+        let should_download_cover = self.app.get_config().read().should_download_cover;
+        if should_download_cover {
+            if let Err(err) = self.download_cover().await {
+                let err_title = format!("`{comic_title}`下载封面失败");
+                let string_chain = err.to_string_chain();
+                tracing::error!(err_title, message = string_chain);
+
+                self.set_state(DownloadTaskState::Failed);
+                self.emit_download_task_update_event();
+
+                return;
+            }
+        }
+'@
+
+          $newCoverFailure = @'
+        let should_download_cover = self.app.get_config().read().should_download_cover;
+        if should_download_cover {
+            if let Err(err) = self.download_cover().await {
+                let err_title = format!("`{comic_title}`下载封面失败，已跳过封面并继续下载章节");
+                let string_chain = err.to_string_chain();
+                tracing::warn!(err_title, message = string_chain);
+            }
+        }
+'@
+
+          $oldDownloadCover = @'
+    async fn download_cover(&self) -> anyhow::Result<()> {
+        let cover_path = self.comic.get_cover_path().context("获取封面路径失败")?;
+        // if cover_path.exists() {
+        //     return Ok(());
+        // }
+
+        let comic_id = self.comic.id;
+        let url = format!("https://cdn-msp3.18comic.vip/media/albums/{comic_id}.jpg");
+
+        let (img_data, _format) = self
+            .app
+            .get_jm_client()
+            .get_img_data_and_format(&url)
+            .await
+            .context(format!("下载图片`{url}`失败"))?;
+
+        std::fs::write(&cover_path, img_data)
+            .context(format!("保存图片`{}`失败", cover_path.display()))?;
+
+        Ok(())
+    }
+'@
+
+          $newDownloadCover = @'
+    async fn download_cover(&self) -> anyhow::Result<()> {
+        let cover_path = self.comic.get_cover_path().context("获取封面路径失败")?;
+        if cover_path.exists() {
+            return Ok(());
+        }
+
+        let comic_id = self.comic.id;
+        let cover_urls = [
+            format!("https://{IMAGE_DOMAIN}/media/albums/{comic_id}.jpg"),
+            format!("https://cdn-msp3.jmapiproxy2.cc/media/albums/{comic_id}.jpg"),
+            format!("https://cdn-msp2.18comic.vip/media/albums/{comic_id}.jpg"),
+            format!("https://cdn-msp3.18comic.vip/media/albums/{comic_id}.jpg"),
+        ];
+
+        let mut last_error = None;
+        for url in cover_urls {
+            match self.app.get_jm_client().get_img_data_and_format(&url).await {
+                Ok((img_data, _format)) => {
+                    std::fs::write(&cover_path, img_data)
+                        .context(format!("保存图片`{}`失败", cover_path.display()))?;
+                    return Ok(());
+                }
+                Err(err) => {
+                    last_error = Some(err.context(format!("下载图片`{url}`失败")));
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow!("下载封面失败，没有可用的封面地址")))
+    }
+'@
+
+          if (-not $content.Contains($oldCoverFailure)) {
+            throw "Cannot find cover failure block in download_manager.rs"
+          }
+          if (-not $content.Contains($oldDownloadCover)) {
+            throw "Cannot find download_cover block in download_manager.rs"
+          }
+
+          $content = $content.Replace($oldCoverFailure, $newCoverFailure)
+          $content = $content.Replace($oldDownloadCover, $newDownloadCover)
+
+          $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+          [System.IO.File]::WriteAllText((Resolve-Path $path), $content, $utf8NoBom)
+
       - name: Build Tauri app
         run: pnpm tauri build
 
